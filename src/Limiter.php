@@ -90,7 +90,7 @@ class Limiter implements MiddlewareInterface
                     $ip = $request->getRealIp();
                     foreach (static::$ipWhiteList as $allowIp) {
                         if ($this->ipInRange($ip, $allowIp)) {
-                            continue 2;
+                            continue 3;
                         }
                     }
                     $key = "$prefix-$request->controller-$request->action-$annotation->key-$ip";
