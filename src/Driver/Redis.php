@@ -9,26 +9,31 @@ use Workerman\Worker;
 class Redis implements DriverInterface
 {
     /**
-     * Lua 脚本：仅延长过期时间，绝不缩短
-     * 返回 hash key 实际的过期时间戳，用于更新本地缓存
+     * Lua script: extend key expiry, never shorten.
+     * Returns 1 if expiry was set/extended, 0 if no change was needed.
      *
      * KEYS[1] = hash key
-     * ARGV[1] = 期望的过期时间戳
+     * ARGV[1] = target expireAt timestamp (PHP already adds +1s conservatively).
      */
     protected const LUA_EXTEND_EXPIRE = <<<'LUA'
-local new_expire = tonumber(ARGV[1])
+local target_expire = tonumber(ARGV[1])
+
 local ttl = redis.call('TTL', KEYS[1])
+-- ttl: -2 (no key) | -1 (no expire) | >=0 (remaining seconds, rounded down)
 if ttl < 0 then
-    redis.call('EXPIREAT', KEYS[1], new_expire)
-    return new_expire
+    return redis.call('EXPIREAT', KEYS[1], target_expire)
 end
+
 local now = tonumber(redis.call('TIME')[1])
-local current_expire = now + ttl
-if new_expire > current_expire then
-    redis.call('EXPIREAT', KEYS[1], new_expire)
-    return new_expire
+-- TTL is rounded down, so the real expireAt is in (now+ttl, now+ttl+1] in general,
+-- but target_expire is integer seconds. So `target_expire > now+ttl` implies
+-- `target_expire >= now+ttl+1`, which is guaranteed to be >= the real expireAt.
+-- This keeps the logic simple while never shortening expiry.
+local current_lower = now + ttl
+if target_expire > current_lower then
+    return redis.call('EXPIREAT', KEYS[1], target_expire)
 end
-return current_expire
+return 0
 LUA;
 
     /**
@@ -45,34 +50,50 @@ LUA;
     public function increase(string $key, int $ttl = 24 * 60 * 60, $step = 1): int
     {
         static $hashKeyExpireAtMap = [];
+        static $lastCleanupAt = 0;
         $connection = RedisClient::connection($this->connection);
 
-        $expireTime = $this->getExpireTime($ttl);
+        $ttl = max(1, $ttl);
+        $step = (int)$step;
+        $now = $this->now();
 
-        $segmentDays = max(1, (int)ceil($ttl / 86400));
-        $segmentSeconds = $segmentDays * 86400;
+        // Fixed window: window end timestamp aligned to ttl on epoch.
+        $expireTime = $this->getExpireTime($ttl, $now);
 
-        $expireDayStart = strtotime(date('Y-m-d', $expireTime));
-        $segmentStart = (int)(floor($expireDayStart / $segmentSeconds) * $segmentSeconds);
-        $segmentEnd = $segmentStart + $segmentSeconds;
+        // Scheme B: bucket by local date of the window start (one hash per day).
+        $windowStart = $expireTime - $ttl;
+        $dayStart = strtotime(date('Y-m-d', $windowStart)); // Local 00:00 (ignore DST).
+        $nextDayStart = $dayStart + 86400;
 
-        $hashKey = 'rate-limiter-' . date('Y-m-d', $segmentStart);
+        $hashKey = 'rate-limiter-' . date('Y-m-d', $dayStart);
         $field = $key . '-' . $expireTime . '-' . $ttl;
 
-        // 绝大多数请求仅执行 HINCRBY（1 次 Redis 调用）
-        $count = $connection->hIncrBy($hashKey, $field, $step);
+        // The hashKey expiry must cover the end boundary of the day's last window.
+        $expireAtNeeded = $this->ceilToTtl($nextDayStart, $ttl);
+        // Conservative +1s to avoid under-estimation due to TTL second rounding.
+        $expireAtTarget = $expireAtNeeded + 1;
 
-        // 仅在本地缓存的过期时间不足时，才通过 Lua 脚本原子检查并延长过期时间
-        if ($segmentEnd > ($hashKeyExpireAtMap[$hashKey] ?? 0)) {
-            $actualExpireAt = (int)$connection->eval(static::LUA_EXTEND_EXPIRE, 1, $hashKey, $segmentEnd);
-            $hashKeyExpireAtMap[$hashKey] = $actualExpireAt;
+        // Hot path: only HINCRBY (1 Redis call).
+        $count = $connection->hIncrBy($hashKey, $field, $step) ?: 0;
 
-            // 清理已过期的缓存条目
-            $now = time();
-            foreach ($hashKeyExpireAtMap as $k => $v) {
-                if ($v <= $now) {
-                    unset($hashKeyExpireAtMap[$k]);
+        // Only attempt to extend expiry when local cache indicates it may be needed.
+        if ($expireAtTarget > ($hashKeyExpireAtMap[$hashKey] ?? 0)) {
+            $res = $this->extendExpire($connection, $hashKey, $expireAtTarget);
+            // If Lua returns 1, we set/extended expiry.
+            // If it returns 0, some process already has an expiry >= target.
+            // In both cases we can advance the local cache to avoid redundant Lua calls.
+            if ($res === 0 || $res === 1) {
+                $hashKeyExpireAtMap[$hashKey] = $expireAtTarget;
+            }
+
+            // Low-frequency cleanup to avoid iterating on every request.
+            if ($now - $lastCleanupAt >= 60) {
+                foreach ($hashKeyExpireAtMap as $k => $v) {
+                    if ($v <= $now) {
+                        unset($hashKeyExpireAtMap[$k]);
+                    }
                 }
+                $lastCleanupAt = $now;
             }
         }
 
@@ -80,16 +101,51 @@ LUA;
     }
 
     /**
-     * 计算当前窗口的过期时间点（整数取模，避免浮点精度问题）
+     * Calculate current window end timestamp using integer math.
      *
      * @param int $ttl
      * @return int
      */
-    protected function getExpireTime(int $ttl): int
+    protected function getExpireTime(int $ttl, int $time): int
     {
-        $time = time();
         $remainder = $time % $ttl;
         return $remainder === 0 ? $time : $time + ($ttl - $remainder);
     }
-    
+
+    /**
+     * Ceil a timestamp to the next ttl-aligned boundary (epoch-aligned).
+     *
+     * @param int $timestamp
+     * @param int $ttl
+     * @return int
+     */
+    protected function ceilToTtl(int $timestamp, int $ttl): int
+    {
+        $ttl = max(1, $ttl);
+        $remainder = $timestamp % $ttl;
+        return $remainder === 0 ? $timestamp : $timestamp + ($ttl - $remainder);
+    }
+
+    /**
+     * Get current time.
+     * Kept as a method to allow unit tests to inject a fake time.
+     * @return int
+     */
+    protected function now(): int
+    {
+        return time();
+    }
+
+    /**
+     * Extend expireAt on the hash key.
+     * Kept as a method to allow unit tests to count/observe the call.
+     * @param object $connection
+     * @param string $hashKey
+     * @param int $expireAtTarget
+     * @return int
+     */
+    protected function extendExpire(object $connection, string $hashKey, int $expireAtTarget): int
+    {
+        return (int)$connection->eval(static::LUA_EXTEND_EXPIRE, 1, $hashKey, $expireAtTarget);
+    }
 }
